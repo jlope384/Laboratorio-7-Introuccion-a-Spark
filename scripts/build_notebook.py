@@ -85,11 +85,11 @@ DATA_PROC = Path("../data/processed")
 DATA_PROC.mkdir(parents=True, exist_ok=True)
 
 ARCHIVOS = [
-    {"periodo_archivo": "2025T1", "anio_archivo": 2025, "trimestre_calendario": 1, "uso": "desarrollo", "archivo": "ENEIC_2025_T1_Personas.xlsx"},
-    {"periodo_archivo": "2025T2", "anio_archivo": 2025, "trimestre_calendario": 2, "uso": "desarrollo", "archivo": "ENEIC_2025_T2_Personas.xlsx"},
-    {"periodo_archivo": "2025T3", "anio_archivo": 2025, "trimestre_calendario": 3, "uso": "desarrollo", "archivo": "ENEIC_2025_T3_Personas.xlsx"},
-    {"periodo_archivo": "2025T4", "anio_archivo": 2025, "trimestre_calendario": 4, "uso": "validacion", "archivo": "ENEIC_2025_T4_Personas.xlsx"},
-    {"periodo_archivo": "2026T1", "anio_archivo": 2026, "trimestre_calendario": 1, "uso": "prueba",     "archivo": "ENEIC_2026_T1_Personas.xlsx"},
+    {"periodo_archivo": "2025T1", "anio_archivo": 2025, "trimestre_calendario": 1, "uso": "desarrollo", "archivo": "Personas_ENEIC_T1_2025.xlsx"},
+    {"periodo_archivo": "2025T2", "anio_archivo": 2025, "trimestre_calendario": 2, "uso": "desarrollo", "archivo": "Personas-ENEIC-T2-2025.xlsx"},
+    {"periodo_archivo": "2025T3", "anio_archivo": 2025, "trimestre_calendario": 3, "uso": "desarrollo", "archivo": "Base-de-datos-Personas-ENEIC-III-2025.xlsx"},
+    {"periodo_archivo": "2025T4", "anio_archivo": 2025, "trimestre_calendario": 4, "uso": "validacion", "archivo": "Base-de-datos-Personas-ENEIC-IV-2025.xlsx"},
+    {"periodo_archivo": "2026T1", "anio_archivo": 2026, "trimestre_calendario": 1, "uso": "prueba",     "archivo": "Base-de-datos-Personas-ENEIC-I-2026.xlsx"},
 ]
 
 faltantes_arch = [a["archivo"] for a in ARCHIVOS if not (DATA_RAW / a["archivo"]).exists()]
@@ -101,7 +101,7 @@ md(r"""
 
 Los códigos categóricos se validan contra el diccionario de datos de la ENEIC. Cualquier valor ausente o no reconocido se representa como `DESCONOCIDO` (nunca como 0). En educación, el código **0 = Ninguno** es una respuesta válida.
 
-> ⚠️ Verifique que las etiquetas de `NIVEL_EDUCATIVO` y `DOMINIO` coincidan con el diccionario entregado con cada base. Más abajo se imprimen los códigos observados para confirmarlo.
+> Etiquetas verificadas contra los diccionarios de I, II, III y IV‑2025 (idénticas en los cuatro). Más abajo se imprimen los códigos observados para detectar valores fuera del diccionario.
 """)
 
 code(r"""
@@ -124,7 +124,8 @@ NIVEL_EDUCATIVO = {      # P03A03A — nivel más alto aprobado
     3: "Básico",
     4: "Diversificado",
     5: "Superior",
-    6: "Postgrado",
+    6: "Maestría",
+    7: "Doctorado",
 }
 DOMINIO = {
     1: "Urbano metropolitano",
@@ -359,7 +360,10 @@ vars_lab = {"P05D01": "salario_mensual", "P05C07A": "antiguedad_anios", "P05C07B
 """)
 
 md(r"""
-La gran mayoría de los nulos de salario, antigüedad y horas se concentran en personas a quienes la pregunta **no les corresponde** (menores de 15, desocupados, inactivos o no asalariados). Los nulos que persisten dentro de los asalariados de 15+ son **no respuesta** real.
+**Interpretación.**
+- `OCUPADOS` tiene ~57 % de nulos, pero no es un faltante: es un **indicador** que vale 1 para los ocupados y queda vacío para el resto (menores, desocupados, inactivos). Por eso `P05C07A`, `P05C07B`, `P05C16` y `P05H01A` tienen **exactamente** el mismo número de nulos (115,454 en 2025): el módulo de empleo solo se aplica a los ocupados.
+- `P05D01` (salario) tiene ~74 % de nulos en toda la base, pero **0 %** entre los asalariados de 15+ años y **100 %** fuera de ese grupo. Todos sus faltantes son estructurales (la pregunta no corresponde), no hay no respuesta de salario en la población analítica.
+- `P03A03A` (educación) tiene ~13 % de nulos, concentrados en niños pequeños a quienes no se les pregunta; ninguno queda en la base filtrada.
 """)
 
 md(r"""
@@ -442,7 +446,11 @@ plt.tight_layout(); plt.show()
 """)
 
 md(r"""
-**Interpretación.** Los pasos 1 a 3 definen la *población* (asalariados de 15+ años) y explican la mayor parte de las exclusiones: en una encuesta de hogares la mayoría de personas son menores, inactivas, desocupadas o trabajadores no asalariados (cuenta propia, patronos, familiares no remunerados). Los pasos 4 a 8 son de *calidad*: eliminan registros sin salario positivo o con antigüedad/horas no evaluables o incoherentes. Ninguna variable objetivo se imputa.
+**Interpretación.** De 203,676 registros de 2025 se conservan **53,025 (26.0 %)**; en 2026T1, 13,258 de 49,843 (26.6 %). La proporción retenida es muy estable entre archivos (25.7 %–26.6 %).
+
+- Los pasos 1 a 3 definen la *población* y explican **todas** las exclusiones: 62,886 menores de 15 años, 52,568 personas de 15+ no ocupadas y 35,197 ocupados no asalariados (cuenta propia, patronos, no remunerados).
+- Los pasos 4 a 8 (calidad) no excluyen ningún registro: todos los asalariados ocupados de 15+ tienen salario positivo, meses de antigüedad entre 0 y 11, antigüedad ≤ edad y horas entre 1 y 168. Los datos publicados ya vienen validados en estas variables. Los filtros se mantienen en el código porque son la regla común que también se aplicará a 2026.
+- No se imputó ningún valor.
 """)
 
 md(r"""
@@ -488,7 +496,7 @@ if len(resumen_dup):
 """)
 
 md(r"""
-**Decisión.** No se usa `dropDuplicates()`. Si aparecen claves repetidas, se documentan arriba: una *repetición exacta* indica una fila copiada en la fuente, mientras que un *conflicto* indica que la clave no identifica a una sola persona en ese corte (por ejemplo, una numeración de hogar que se reinicia por región o un error de captura). Ambos casos se marcan con la columna `clave_duplicada` en la base preparada para que el análisis posterior pueda evaluar su efecto. Una misma persona en **periodos distintos** no es un duplicado.
+**Resultado.** La combinación `periodo_archivo + NUM_HOGAR + NUM_PERSONA` es **única** en los 253,519 registros crudos y en los 66,283 filtrados: no hay repeticiones exactas ni registros en conflicto, así que no fue necesario eliminar nada (y no se usó `dropDuplicates()`). El código de clasificación se deja para que el control sea reproducible: si en el futuro apareciera una clave repetida, se distinguiría entre *repetición exacta* (fila copiada en la fuente) y *conflicto* (la clave no identifica a una sola persona) y se marcaría en la columna `clave_duplicada`. Una misma persona en **períodos distintos** no es un duplicado.
 """)
 
 md(r"""
@@ -532,7 +540,7 @@ md(r"""
 Porque tiene **302 columnas** frente a las 270 de los demás: incorpora variables nuevas que desplazan el orden. Un `union()` posicional pegaría la columna *i* de un archivo con la columna *i* de otro aunque signifiquen cosas distintas (por ejemplo, un código de educación quedaría bajo el nombre de salario) sin generar ningún error, y los tipos podrían coincidir por casualidad. `unionByName` empareja las columnas por su **nombre**, lo que garantiza que cada variable se combine con su equivalente, independientemente de su posición. Además, antes de unir se normalizan los encabezados y se seleccionan solo las columnas requeridas.
 
 **¿Qué diferencia existe entre un dato ausente porque la pregunta no corresponde y una respuesta no registrada?**
-Un ausente *porque no corresponde* es **estructural**: el cuestionario tiene saltos (filtros) y, por diseño, a un menor de edad, a un inactivo o a un trabajador por cuenta propia no se le pregunta el sueldo de asalariado. No es información perdida; la variable simplemente no aplica y esas personas quedan fuera de la población analítica. Una *respuesta no registrada* es **no respuesta**: la pregunta sí aplicaba (asalariado de 15+ años) pero el dato no se capturó (se negó, no sabía, error de captura). Solo esta última es un problema de calidad que puede sesgar resultados. La tabla de la sección 1.4 lo muestra: casi todos los nulos de salario aparecen fuera de la población asalariada.
+Un ausente *porque no corresponde* es **estructural**: el cuestionario tiene saltos (filtros) y, por diseño, a un menor de edad, a un inactivo o a un trabajador por cuenta propia no se le pregunta el sueldo de asalariado. No es información perdida; la variable simplemente no aplica y esas personas quedan fuera de la población analítica. Una *respuesta no registrada* es **no respuesta**: la pregunta sí aplicaba (asalariado de 15+ años) pero el dato no se capturó (se negó, no sabía, error de captura). Solo esta última es un problema de calidad que puede sesgar resultados. La sección 1.4 lo muestra con los datos: el 74 % de nulos del salario corresponde **totalmente** a personas a quienes no se les pregunta (100 % de nulos fuera de la población y 0 % dentro). Tratar esos nulos como no respuesta, o imputarlos, sería un error grave.
 
 **¿Por qué una persona observada en dos períodos no debe eliminarse como duplicado del conjunto longitudinal?**
 La ENEIC es un panel rotativo: un hogar permanece varios trimestres en la muestra. Cada fila representa a una **persona en un período**, con su edad, salario, horas y antigüedad de *ese* trimestre. Dos observaciones de la misma persona en trimestres distintos son mediciones diferentes y legítimas, no copias. Eliminarlas reduciría artificialmente la muestra de ciertos trimestres, rompería la comparabilidad entre cortes y sesgaría los resultados hacia los hogares que rotan antes. Por eso la unicidad se verifica **dentro** de cada `periodo_archivo`. (Para la validación de los modelos sí conviene recordar que las observaciones repetidas no son independientes.)
@@ -609,7 +617,10 @@ plt.tight_layout(); plt.show()
 """)
 
 md(r"""
-**Interpretación.** *(Revisar con los valores obtenidos.)* La categoría **empleado de empresa privada** concentra la mayor parte de los asalariados, seguida por jornaleros/peones y empleados de gobierno; el servicio doméstico es el grupo más pequeño. En educación predominan los niveles de primaria y diversificado, y la educación superior representa una proporción menor. Los tres dominios tienen tamaños que dependen del diseño muestral (no de la población), lo que refuerza que los conteos no ponderados no son proporciones nacionales. Las categorías con pocos registros (p. ej., postgrado o `DESCONOCIDO`) producirán estimaciones más inestables.
+**Interpretación.**
+- **Categoría ocupacional:** los empleados de **empresa privada** son más de la mitad de los registros (28,702; 54.1 %), seguidos por **jornaleros o peones** (13,842; 26.1 %), **empleados de gobierno** (6,575; 12.4 %) y **servicio doméstico** (3,906; 7.4 %).
+- **Nivel educativo:** predominan **diversificado** (31.8 %) y **primaria** (29.8 %), seguidos por básico (15.6 %), superior (12.9 %) y ninguno (7.5 %). Maestría (771; 1.5 %), preprimaria (459) y sobre todo **doctorado (60 registros)** son grupos muy pequeños: sus estadísticas serán inestables y, en los modelos, sus categorías *one‑hot* tendrán poco soporte. No quedaron registros `DESCONOCIDO` en la población analítica.
+- **Dominio:** urbano metropolitano 41.6 %, resto urbano 38.0 % y rural nacional 20.4 %. Estas proporciones reflejan el **diseño muestral** (sobremuestreo por dominio) y la concentración del empleo asalariado en zonas urbanas; como no están ponderadas, no son la distribución nacional.
 """)
 
 md("### 2.2 Forma de la distribución del salario")
@@ -640,9 +651,9 @@ plt.tight_layout(); plt.show()
 """)
 
 md(r"""
-**¿El salario presenta una distribución simétrica o asimétrica?** Es **asimétrica positiva (sesgada a la derecha)**: el coeficiente de asimetría calculado en Spark sobre todos los registros es claramente mayor que 0, la mayoría de salarios se agrupa en valores bajos/medios y una cola larga de salarios altos se extiende a la derecha. En escala logarítmica la distribución se vuelve mucho más simétrica, lo que indica un comportamiento aproximadamente log‑normal. La escala log solo se usa para visualizar; el objetivo del modelado sigue siendo `salario_mensual` en quetzales.
+**¿El salario presenta una distribución simétrica o asimétrica?** Es **fuertemente asimétrica a la derecha**: el coeficiente de asimetría calculado sobre los 53,025 registros es **6.0**. La mitad central de los salarios está entre **Q1,800 (P25) y Q4,000 (P75)**, el P95 es Q8,000 y la cola se extiende hasta **Q99,000**, 33 veces la mediana. En escala logarítmica la distribución se vuelve mucho más simétrica, con una forma cercana a la log‑normal. Se ven picos en valores redondos (Q3,000, Q4,000…), típicos de salarios declarados en una encuesta. En el extremo inferior hay pocos salarios muy bajos (P1 = Q225, mínimo Q1; 22 registros bajo Q100) que probablemente corresponden a trabajos de pocas horas o a errores de declaración. Se conservan, como pide la guía, y su influencia se discutirá en el modelado. La escala log solo se usa para visualizar: el objetivo sigue siendo `salario_mensual` en quetzales.
 
-**¿Qué diferencia existe entre su media y su mediana?** La **media es mayor que la mediana** (ver la diferencia impresa arriba). La media es sensible a los valores extremos de la cola derecha, que la "jalan" hacia arriba; la mediana representa mejor al asalariado típico. Por eso en las comparaciones entre grupos se usa la mediana. Los salarios extremos **no se eliminan**: son reales en la muestra, pero influirán fuertemente en métricas cuadráticas como el RMSE en la parte de modelado.
+**¿Qué diferencia existe entre su media y su mediana?** La **media (Q3,421.68) supera a la mediana (Q3,000.00) en Q421.68, un 14.1 %**. La cola derecha "jala" la media hacia arriba, mientras que la mediana representa mejor al asalariado típico; por eso las comparaciones entre grupos usan la mediana. La desviación estándar (Q2,902) es casi del tamaño de la media, otra señal de alta dispersión. Los salarios extremos **no se eliminan**, pero pesarán mucho en métricas cuadráticas como el RMSE: unos pocos salarios de Q30,000+ pueden dominar el error de los modelos.
 """)
 
 md("### 2.3 Salario mediano por nivel educativo y categoría ocupacional")
@@ -692,7 +703,10 @@ plt.tight_layout(); plt.show()
 """)
 
 md(r"""
-**Interpretación.** *(Revisar con los valores obtenidos.)* El salario mediano **aumenta con el nivel educativo**; el salto es más pronunciado a partir de diversificado y, sobre todo, en educación superior y postgrado, donde también se amplía el rango intercuartílico. Por categoría ocupacional, los **empleados de gobierno** muestran la mediana más alta, seguidos por empleados de empresa privada; **jornaleros/peones** y **servicio doméstico** tienen las medianas más bajas. Parte de la diferencia entre categorías se relaciona con la composición educativa de cada grupo (el boxplot conjunto muestra que dentro de un mismo nivel también hay brechas entre categorías). Son asociaciones descriptivas, no efectos causales.
+**Interpretación.**
+- **Nivel educativo:** el salario mediano **crece de forma monótona con la educación**: Ninguno Q1,500 → Preprimaria Q2,160 → Primaria Q2,200 → Básico Q2,800 → Diversificado Q3,600 → Superior Q5,000 → Maestría Q10,000 → Doctorado Q12,000. El gradiente es suave hasta básico y se **acelera desde diversificado**: la mediana de maestría duplica la de superior. También se amplía el rango intercuartílico (Maestría: Q6,000–Q15,000), así que los niveles altos no solo ganan más, sino también de forma más heterogénea. La mediana de doctorado se basa en solo 60 registros.
+- **Categoría ocupacional:** servicio doméstico Q1,000 < jornalero o peón Q1,800 < empresa privada Q3,567.50 < **gobierno Q5,000**. La mediana del gobierno es **5 veces** la del servicio doméstico. La distribución de empresa privada es muy concentrada (P25–P75: Q2,800–Q4,000), cerca del salario mínimo. En los jornaleros y el servicio doméstico, el P75 queda por debajo de la mediana general, lo que es coherente con trabajos por jornal o de tiempo parcial.
+- El boxplot conjunto muestra que **dentro de un mismo nivel educativo persisten brechas entre categorías**, y que parte de la ventaja del gobierno se explica porque concentra a más personas con educación superior. Son asociaciones descriptivas, no efectos causales.
 """)
 
 md("### 2.4 Tamaño de la muestra analítica y salario mediano por trimestre")
@@ -724,7 +738,10 @@ por_trim
 """)
 
 md(r"""
-**Interpretación.** *(Revisar con los valores obtenidos.)* El tamaño de la muestra analítica es similar entre trimestres (la proporción retenida de cada archivo es estable), por lo que ningún trimestre domina el conjunto de entrenamiento. El salario mediano varía poco entre trimestres; las diferencias pequeñas pueden deberse a la rotación de la muestra y a la estacionalidad (p. ej., cosechas que aumentan el peso de jornaleros en ciertos trimestres), no necesariamente a cambios reales en los salarios. La media es más volátil que la mediana porque depende de unos pocos salarios extremos.
+**Interpretación.**
+- **Tamaño:** la muestra analítica es muy estable en T1–T3 (13,419; 13,492; 13,450) y **baja en T4 (12,664, −6 %)**, en parte porque el archivo de IV‑2025 tiene menos registros (49,338). La proporción retenida se mantiene cerca de 26 % en todos, así que ningún trimestre domina el entrenamiento.
+- **Salario:** la mediana es **Q3,000 en T1 y T2 y sube a Q3,200 en T3 y T4** (+6.7 %). La media crece de forma continua (Q3,316 → Q3,365 → Q3,469 → Q3,545; +6.9 % en el año). Es una tendencia creciente moderada; la mediana avanza en escalones porque los salarios se declaran en valores redondos.
+- Estas variaciones pueden reflejar ajustes salariales, pero también la **rotación de la muestra** y la estacionalidad del empleo (p. ej., cosechas que cambian el peso de los jornaleros). Para la prueba en 2026T1 significa que un modelo entrenado con 2025 podría quedar ligeramente desfasado si la tendencia continúa.
 """)
 
 # ---------------------------------------------------------------------------
@@ -780,9 +797,14 @@ plt.tight_layout(); plt.show()
 """)
 
 md(r"""
-**¿Qué variables presentan mayor asociación lineal con el salario?** *(Revisar con los valores obtenidos.)* Las correlaciones de Pearson con el salario son **positivas pero débiles** en todas las variables numéricas. La **antigüedad** suele ser la de mayor asociación (más años en el empleo se asocian a mejores salarios), seguida por la **edad**; las **horas habituales** tienen una asociación lineal muy baja, porque muchas jornadas largas corresponden a ocupaciones de bajo salario (jornaleros, servicio doméstico). Que ninguna correlación sea alta indica que el salario depende en gran medida de factores categóricos (educación, categoría ocupacional, dominio) y de relaciones no lineales. Además, Pearson es sensible a la cola de salarios extremos: la correlación de Spearman (por rangos) sirve para comprobar si la relación monótona es más fuerte que la lineal.
+**¿Qué variables presentan mayor asociación lineal con el salario?** Todas las correlaciones de Pearson con el salario son **positivas pero débiles**:
+- **Antigüedad: r = 0.18**, la mayor. Más tiempo en el mismo empleo se asocia a salarios algo mayores.
+- **Edad: r = 0.15.**
+- **Horas habituales: r = 0.08**, prácticamente nula. Las jornadas largas se concentran en ocupaciones de bajo salario, y parte de las jornadas cortas son de profesionales bien pagados, así que ambos efectos se compensan.
 
-**¿Existe relación entre edad y antigüedad?** Sí: es la correlación **más alta** de la matriz y es positiva. Tiene sentido estructural, porque la antigüedad está acotada por la edad (nadie puede tener más antigüedad que años de vida laboral); por eso el diagrama muestra un "triángulo": las personas jóvenes solo pueden tener poca antigüedad, mientras que las mayores pueden tener mucha o poca (cambios de empleo). Esta colinealidad moderada debe considerarse al interpretar coeficientes de la regresión lineal y al elegir variables para el clustering.
+Aun la variable más asociada explica apenas ~3 % de la varianza lineal del salario (r² ≈ 0.03). El salario depende mucho más de factores **categóricos** (la mediana va de Q1,500 a Q12,000 según la educación y de Q1,000 a Q5,000 según la categoría) y de relaciones no lineales. Además, Pearson es sensible a los salarios extremos; la matriz de Spearman, basada en rangos, sirve de control de robustez. Para la regresión lineal, esto anticipa un R² modesto si solo se usaran las variables numéricas.
+
+**¿Existe relación entre edad y antigüedad?** Sí: es la asociación **más fuerte de la matriz (Pearson = 0.49; Spearman = 0.42)**, positiva y moderada. Tiene sentido estructural: la antigüedad está acotada por la edad, y el diagrama forma un "triángulo" bajo la línea antigüedad = edad − 15. Los jóvenes solo pueden tener poca antigüedad, mientras que los mayores pueden tener mucha o poca, según si cambiaron de empleo. No es una relación redundante (r < 0.5), pero sí una colinealidad moderada que debe considerarse al interpretar los coeficientes de la regresión lineal. Edad y horas tienen una relación ligeramente negativa (r = −0.11): los trabajadores de mayor edad tienden a jornadas un poco más cortas.
 """)
 
 # ---------------------------------------------------------------------------
@@ -861,17 +883,22 @@ plt.tight_layout(); plt.show()
 md(r"""
 ### 4.2 Criterio del grupo para elegir K
 
-Se elige K en la **opción A** con el siguiente criterio:
-1. **Mayor coeficiente de silueta** (cohesión y separación de los grupos, calculado sobre todos los registros);
-2. siempre que el cluster más pequeño contenga **al menos el 5 %** de los registros (grupos útiles y estables);
-3. contrastado con el **codo** del WSSSE y con que los perfiles resultantes sean **interpretables**.
+Se elige K en la **opción A** combinando tres condiciones:
+1. **Codo del WSSSE:** el menor K a partir del cual agregar un cluster más reduce la suma de cuadrados intra‑cluster en **menos de 10 %** (rendimientos decrecientes).
+2. **Silueta aceptable (≥ 0.40)**, calculada sobre todos los registros.
+3. Cluster más pequeño con **al menos 5 %** de los registros, para que cada perfil sea útil y estable.
+
+No se usa solo la silueta máxima porque favorece sistemáticamente K = 2, que parte la población en "jóvenes" y "mayores" sin distinguir, por ejemplo, la jornada. Ese resultado es poco informativo para el objetivo del laboratorio.
 """)
 
 code(r"""
-cand = res_km[(res_km["opcion"] == "A: sin salario") & (res_km["pct_cluster_mas_pequeno"] >= 5)]
-if cand.empty:
-    cand = res_km[res_km["opcion"] == "A: sin salario"]
-K_ELEGIDO = int(cand.sort_values("silueta", ascending=False).iloc[0]["k"])
+res_a = res_km[res_km["opcion"] == "A: sin salario"].set_index("k").copy()
+res_a["reduccion_wssse_al_siguiente_k_%"] = 100 * (1 - res_a["wssse"].shift(-1) / res_a["wssse"])
+display(res_a[["silueta", "wssse", "reduccion_wssse_al_siguiente_k_%", "pct_cluster_mas_pequeno"]])
+
+validos = res_a[(res_a["silueta"] >= 0.40) & (res_a["pct_cluster_mas_pequeno"] >= 5)]
+codo = validos[validos["reduccion_wssse_al_siguiente_k_%"] < 10]
+K_ELEGIDO = int(codo.index.min() if len(codo) else validos["silueta"].idxmax())
 print(f"K elegido (opción A): {K_ELEGIDO}")
 print(res_km[res_km["k"] == K_ELEGIDO].set_index("opcion")[["silueta", "pct_cluster_mas_pequeno"]])
 
@@ -880,7 +907,9 @@ seg = modelo_km.transform(base_km).drop("x", "features").cache()
 """)
 
 md(r"""
-**¿Vale la pena incluir el salario?** Compare las siluetas de ambas opciones en la tabla y el gráfico anteriores. Al agregar `log_salario` se añade una dimensión más y la silueta suele **disminuir** (o no mejorar significativamente) porque el salario no forma grupos bien separados: varía de forma continua dentro de cada combinación de edad, antigüedad y jornada. Además, los clusters de la opción B tienden a partirse simplemente por "salario alto / bajo", lo que no aporta un perfil nuevo y sería circular respecto al modelo supervisado. Por estas razones, **la segmentación final no incluye el salario** y este se usa para *describir* los perfiles.
+**Elección de K.** La reducción del WSSSE es grande de K = 2 a 3 (−21 %) y de 3 a 4 (−24 %), pero **casi nula de 4 a 5 (−4 %)**: el codo está en **K = 4**. Además, K = 4 es un **máximo local de la silueta (0.47**, frente a 0.44 con K = 3 y K = 5) y su cluster más pequeño tiene 12.9 % de los registros. K = 5 apenas mejora el ajuste y genera un grupo de solo 5 %. K = 2 tiene la silueta más alta (0.55), pero solo separa jóvenes de mayores.
+
+**¿Vale la pena incluir el salario?** **No.** Al añadir `log_salario` (opción B) la silueta **baja con K = 2, 4 y 5** (con K = 4: 0.47 → 0.37) y el WSSSE crece para todo K. El salario no forma grupos bien separados: varía de forma continua dentro de cada combinación de edad, antigüedad y jornada, y agrega una dimensión ruidosa que empeora la separación. Solo con K = 3 la opción B tiene una silueta algo mayor (0.48 frente a 0.44), a costa de partir los grupos por "salario alto / bajo". Esa división no aporta un perfil nuevo y sería circular respecto al modelo supervisado, cuyo objetivo es justamente el salario. **La segmentación final no incluye el salario** y este se usa para *describir* los perfiles.
 """)
 
 md("### 4.3 Perfil de cada cluster")
@@ -951,22 +980,20 @@ plt.tight_layout(); plt.show()
 md(r"""
 ### 4.4 Descripción de los clusters
 
-Para que la etiqueta de cada grupo se base en los resultados, se compara el centroide de cada cluster con los terciles globales de edad y antigüedad y con umbrales de jornada (< 40 h parcial, 40–48 h completa, > 48 h extendida), y se añade la categoría ocupacional y el nivel educativo predominantes.
+Para que la etiqueta de cada grupo se base en los resultados, el centroide de cada cluster (en unidades originales) se clasifica con umbrales fijos y fáciles de interpretar:
+- **Edad:** < 35 jóvenes; 35–54 adultos; ≥ 55 adultos mayores.
+- **Antigüedad:** < 5 años baja; 5–10 media; > 10 alta.
+- **Jornada:** < 35 h parcial; 35–48 h estándar (la jornada legal diurna es de 44–48 h); > 48 h extendida.
+
+A esto se añaden la categoría ocupacional y el nivel educativo predominantes.
 """)
 
 code(r"""
-terc = {c: df25.select(F.expr(f"percentile({c}, array(0.3333, 0.6667))")).first()[0] for c in ["edad", "antiguedad"]}
-
-
-def nivel(v, cortes, nombres):
-    return nombres[0] if v < cortes[0] else (nombres[1] if v < cortes[1] else nombres[2])
-
-
 def describir(c):
-    e = nivel(centros.loc[c, "edad"], terc["edad"], ["jóvenes", "adultos", "adultos mayores"])
-    a = nivel(centros.loc[c, "antiguedad"], terc["antiguedad"], ["baja antigüedad", "antigüedad media", "alta antigüedad"])
-    h = centros.loc[c, "horas_semanales"]
-    j = "jornada parcial" if h < 40 else ("jornada completa" if h <= 48 else "jornada extendida")
+    e, a, h = centros.loc[c, "edad"], centros.loc[c, "antiguedad"], centros.loc[c, "horas_semanales"]
+    e = "jóvenes" if e < 35 else ("adultos" if e < 55 else "adultos mayores")
+    a = "baja antigüedad" if a < 5 else ("antigüedad media" if a <= 10 else "alta antigüedad")
+    j = "jornada parcial" if h < 35 else ("jornada estándar" if h <= 48 else "jornada extendida")
     cat = comp_cat.loc[c].idxmax(); edu = comp_edu.loc[c].idxmax()
     return f"{e.capitalize()}, {a}, {j}; predomina {cat.lower()} ({comp_cat.loc[c].max():.0f}%) y nivel {edu.lower()}"
 
@@ -977,12 +1004,18 @@ perfil[["n", "pct", "edad_mediana", "antig_mediana", "horas_mediana", "salario_m
 """)
 
 md(r"""
-**Interpretación de la segmentación.** *(Revisar y ajustar con los perfiles obtenidos.)*
+**Interpretación de la segmentación (K = 4).** Los números de cluster que asigna KMeans son arbitrarios; los perfiles se identifican por sus centroides:
 
-- El K elegido maximiza la silueta respetando un tamaño mínimo de grupo, por lo que ofrece la partición más clara sin crear segmentos marginales.
-- Los clusters se diferencian principalmente por **etapa de vida laboral** (edad y antigüedad, que están correlacionadas) y por **intensidad de la jornada**. Típicamente aparecen: (i) trabajadores **jóvenes con poca antigüedad**; (ii) trabajadores **adultos con alta antigüedad**, con mayor presencia de empleados de gobierno y niveles educativos más altos, y con el **salario mediano más alto**; y (iii) un grupo con **jornadas extendidas** o, en el otro extremo, **jornadas parciales**, donde pesan más jornaleros y servicio doméstico.
-- Aunque el salario no se usó para formar los grupos, su mediana difiere entre clusters, lo que muestra que el perfil laboral está asociado con el ingreso. Sin embargo, la dispersión salarial dentro de cada cluster es amplia, por lo que el perfil por sí solo no basta para predecir el salario: esto motiva los modelos supervisados de la segunda parte, que añaden educación, categoría ocupacional y dominio.
-- Los resultados describen los **registros analizados sin ponderar**; con `FACTOR` se podría estimar el tamaño poblacional de cada perfil.
+| Perfil | Peso | Edad / antigüedad / horas (medianas) | Salario mediano | Rasgos |
+|---|---|---|---|---|
+| **1. Jóvenes que se inician** | ≈ 46 % | 26 años / 1.3 años / 44 h | Q3,000 | Jornada estándar y empleo reciente; mayoría en empresa privada (57 %) y 29 % jornaleros; nivel educativo intermedio. El grupo más numeroso. |
+| **2. Jóvenes con jornada extendida** | ≈ 17 % | 29 años / 2 años / 72 h | Q3,000 | Jornadas muy largas (media 74 h); 67 % en empresa privada, pocos con educación superior (6 %). Trabajan mucho más por un salario similar, así que su **salario por hora es el más bajo** del grupo de tiempo completo. |
+| **3. Adultos con empleo reciente** | ≈ 24 % | 47 años / 3 años / 42 h | Q3,000 | Edad madura pero poca antigüedad: rotación laboral o reinserción. Mayor peso del **servicio doméstico (12 %)** y de jornaleros (27 %); 52 % con primaria o menos. |
+| **4. Trayectoria estable** | ≈ 13 % | 48 años / 20 años / 40 h | **Q3,800** | Alta antigüedad; concentra a los **empleados de gobierno (31 %)** y la mayor proporción con educación superior (25 %). Es el único perfil con salario mediano claramente mayor. |
+
+- Los perfiles se definen por la **etapa de la vida laboral** (edad y antigüedad) y por la **intensidad de la jornada**. Que la jornada aparezca como un eje propio (perfil 2) es justamente lo que K = 2 no captaba.
+- Aunque el salario no se usó para formar los grupos, solo el perfil de **trayectoria estable** se separa en salario (+27 % sobre la mediana general de Q3,000). Los otros tres tienen la misma mediana, y la dispersión salarial dentro de cada cluster es amplia. Esto confirma lo visto en la sección 3: edad, antigüedad y horas explican poco del salario por sí solas. La educación y la categoría ocupacional, que se agregan en los modelos supervisados, son las que marcan las mayores diferencias.
+- Los resultados describen los **registros analizados sin ponderar**; con `FACTOR` se podría estimar cuántos asalariados del país pertenecen a cada perfil.
 """)
 
 code(r"""
@@ -994,9 +1027,9 @@ print("Etiquetas de cluster guardadas (solo para análisis descriptivo; no se us
 # ---------------------------------------------------------------------------
 nb = {
     "cells": [
-        {"cell_type": t, "metadata": {}, "source": s.splitlines(keepends=True),
+        {"cell_type": t, "id": f"c{i:03d}", "metadata": {}, "source": s.splitlines(keepends=True),
          **({"outputs": [], "execution_count": None} if t == "code" else {})}
-        for t, s in CELLS
+        for i, (t, s) in enumerate(CELLS)
     ],
     "metadata": {
         "kernelspec": {"display_name": "Python 3 (ipykernel)", "language": "python", "name": "python3"},

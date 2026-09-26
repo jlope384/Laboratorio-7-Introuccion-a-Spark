@@ -1,4 +1,3 @@
-data/
 spark-warehouse/
 metastore_db/
 derby.log
