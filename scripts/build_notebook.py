@@ -47,10 +47,11 @@ import seaborn as sns
 
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import VectorAssembler, StandardScaler
+from pyspark.ml.feature import VectorAssembler, StandardScaler, StringIndexer, OneHotEncoder
 from pyspark.ml.stat import Correlation
 from pyspark.ml.clustering import KMeans
-from pyspark.ml.evaluation import ClusteringEvaluator
+from pyspark.ml.regression import LinearRegression, RandomForestRegressor
+from pyspark.ml.evaluation import ClusteringEvaluator, RegressionEvaluator
 
 spark = (
     SparkSession.builder
@@ -59,9 +60,10 @@ spark = (
     .config("spark.driver.memory", "4g")
     .config("spark.sql.shuffle.partitions", "8")
     .config("spark.sql.session.timeZone", "America/Guatemala")
+    .config("spark.ui.showConsoleProgress", "false")
     .getOrCreate()
 )
-spark.sparkContext.setLogLevel("WARN")
+spark.sparkContext.setLogLevel("ERROR")
 
 SEED = 42
 N_MUESTRA_GRAF = 10_000          # tamaño máximo de las muestras que se llevan a pandas
@@ -1022,6 +1024,406 @@ code(r"""
 seg.select("periodo_archivo", "NUM_HOGAR", "NUM_PERSONA", "cluster").write.mode("overwrite") \
    .parquet(str(DATA_PROC / "clusters_2025.parquet"))
 print("Etiquetas de cluster guardadas (solo para análisis descriptivo; no se usan como predictor).")
+""")
+
+# ---------------------------------------------------------------------------
+md(r"""
+---
+# 5. Pipeline de regresión lineal
+
+**Tarea:** estimar `salario_mensual` a partir de exactamente seis predictores: `edad`, `antiguedad`, `horas_semanales` (numéricos) y `nivel_educativo`, `categoria_ocupacional`, `dominio` (categóricos). Es una predicción del salario del período observado, no un pronóstico futuro.
+
+### 5.1 Entrenamiento, validación y prueba
+
+Siguiendo la tabla de la guía (I–III de 2025 para desarrollo, IV‑2025 también para validación y luego para el entrenamiento final, I‑2026 reservado para la prueba):
+
+- **Entrenamiento (selección de hiperparámetros):** 2025 T1–T3.
+- **Validación:** 2025 T4.
+- **Entrenamiento final** (una vez elegida la configuración): los cuatro trimestres de 2025 (`df25`) — incluye a T4.
+- **Prueba final (actividad 7):** 2026 T1 (`df26`); no se toca hasta la sección 7.
+
+Todos los componentes del pipeline (índices, codificación, escalamiento interno y el modelo) se ajustan **solo** con los datos de entrenamiento correspondientes a cada etapa.
+""")
+
+code(r"""
+CAT_COLS = ["nivel_educativo", "categoria_ocupacional", "dominio"]
+NUM_COLS = ["edad", "antiguedad", "horas_semanales"]
+CLAVE = ["periodo_archivo", "NUM_HOGAR", "NUM_PERSONA"]
+
+TRAIN_PERIODOS_SUP = ["2025T1", "2025T2", "2025T3"]
+VALID_PERIODO_SUP = "2025T4"
+
+train_sup = df25.filter(F.col("periodo_archivo").isin(TRAIN_PERIODOS_SUP)).cache()
+valid_sup = df25.filter(F.col("periodo_archivo") == VALID_PERIODO_SUP).cache()
+
+print(f"Entrenamiento (T1–T3 2025): {train_sup.count():,} registros")
+print(f"Validación (T4 2025): {valid_sup.count():,} registros")
+print(f"Entrenamiento final (2025 completo): {df25.count():,} registros")
+print(f"Prueba final (2026T1, reservada): {df26.count():,} registros")
+""")
+
+md(r"""
+### 5.2 Modelo de referencia
+
+Antes de ajustar cualquier modelo, se define un **modelo de referencia** (*baseline*) que predice, para todos los registros, la **media del salario en el conjunto de entrenamiento**. Es el modelo más simple que no usa ningún predictor; cualquier modelo con información real debe superarlo. Se recalcula la media sobre el conjunto de entrenamiento que corresponda en cada etapa (T1–T3 al validar, 2025 completo al evaluar en 2026).
+""")
+
+code(r"""
+def evaluar(pred, etiqueta):
+    metricas = {}
+    for m in ["mae", "rmse", "r2"]:
+        ev = RegressionEvaluator(labelCol="salario_mensual", predictionCol="salario_predicho", metricName=m)
+        metricas[m] = ev.evaluate(pred)
+    return {"config": etiqueta, "MAE": metricas["mae"], "RMSE": metricas["rmse"], "R2": metricas["r2"]}
+
+
+media_train_sup = train_sup.agg(F.mean("salario_mensual")).first()[0]
+base_valid = valid_sup.withColumn("salario_predicho", F.lit(media_train_sup))
+res_base_valid = evaluar(base_valid, "referencia (media)")
+print(f"Media de referencia (T1–T3): Q{media_train_sup:,.2f}")
+pd.DataFrame([res_base_valid]).set_index("config")
+""")
+
+md(r"""
+### 5.3 Construcción del pipeline
+
+a. `StringIndexer` (una instancia con las tres columnas) convierte cada categoría a un índice numérico; `handleInvalid="keep"` asigna un índice adicional a cualquier categoría no vista (por diseño no debería ocurrir, ya que `DESCONOCIDO` es una categoría más del diccionario).
+
+b. `OneHotEncoder` transforma esos índices en vectores dispersos (uno por variable categórica).
+
+c. `VectorAssembler` combina `edad`, `antiguedad`, `horas_semanales` con los tres vectores *one‑hot* en un solo vector `features`.
+
+d. La estandarización se aplica mediante la opción interna de `LinearRegression` (`standardization=True`, su valor por defecto): estandariza los predictores para optimizar y devuelve los coeficientes ya en la escala original. No se usa además un `StandardScaler` externo, como pide la guía.
+""")
+
+code(r"""
+def pipeline_lr(regParam, elasticNetParam):
+    idx = StringIndexer(inputCols=CAT_COLS, outputCols=[f"{c}_idx" for c in CAT_COLS], handleInvalid="keep")
+    ohe = OneHotEncoder(inputCols=[f"{c}_idx" for c in CAT_COLS], outputCols=[f"{c}_ohe" for c in CAT_COLS])
+    ensamblador = VectorAssembler(inputCols=NUM_COLS + [f"{c}_ohe" for c in CAT_COLS], outputCol="features")
+    lr = LinearRegression(featuresCol="features", labelCol="salario_mensual", predictionCol="salario_predicho",
+                           regParam=regParam, elasticNetParam=elasticNetParam, standardization=True)
+    return Pipeline(stages=[idx, ohe, ensamblador, lr])
+
+
+# Configuraciones de regularización probadas (regParam, elasticNetParam):
+CONFIGS_LR = [
+    ("sin_reg", 0.0, 0.0),        # sin penalización (referencia interna)
+    ("ridge_leve", 0.3, 0.0),     # L2 leve
+    ("ridge_fuerte", 50.0, 0.0),  # L2 fuerte
+    ("lasso_fuerte", 50.0, 1.0),  # L1 fuerte
+]
+
+resultados_lr, modelos_lr = [], {}
+for nombre, regParam, elastic in CONFIGS_LR:
+    modelo = pipeline_lr(regParam, elastic).fit(train_sup)
+    pred_valid = modelo.transform(valid_sup)
+    r = evaluar(pred_valid, nombre)
+    r["regParam"], r["elasticNetParam"] = regParam, elastic
+    resultados_lr.append(r)
+    modelos_lr[nombre] = modelo
+
+res_lr = pd.DataFrame(resultados_lr).set_index("config")
+res_lr
+""")
+
+code(r"""
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+axes[0].bar(res_lr.index, res_lr["RMSE"], color="#4C72B0")
+axes[0].axhline(res_base_valid["RMSE"], color="crimson", ls="--", label=f"Referencia (Q{res_base_valid['RMSE']:,.0f})")
+axes[0].set_title("RMSE de validación por configuración (regresión lineal)"); axes[0].legend()
+axes[1].bar(res_lr.index, res_lr["R2"], color="#55A868")
+axes[1].set_title("R² de validación por configuración")
+for ax in axes:
+    ax.tick_params(axis="x", rotation=20)
+    ax.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.2f}" if ax is axes[1] else "{x:,.0f}"))
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+**Selección de configuración.** Las cuatro configuraciones obtienen un desempeño casi idéntico (RMSE entre Q2,186 y Q2,195; R² entre 0.421 y 0.426): con **40,361** registros de entrenamiento y solo **21** columnas en el vector de predictores, el modelo no está sobreajustado, así que penalizar los coeficientes apenas cambia el ajuste. La configuración **sin regularización (`regParam = 0`)** obtiene el **menor RMSE de validación (Q2,186.42**, MAE Q1,210.14, R² 0.4257) y es la que se usa en adelante. `lasso_fuerte` logra el mejor MAE (Q1,196.66) porque el `solver` de mínimos cuadrados detectó inestabilidad numérica (advertencia *"Cholesky solver failed due to singular covariance matrix"*, por categorías con muy pocos registros como doctorado) y una penalización L1 fuerte encoge esos coeficientes inestables; a cambio, empeora ligeramente el RMSE porque reduce la precisión en esos mismos grupos pequeños, que pesan más en una métrica cuadrática. Frente al **modelo de referencia** (predecir la media: RMSE Q2,889.57, R² ≈ 0), la regresión lineal reduce el RMSE en **24.3 %** y el MAE en **27.6 %**, y explica cerca del **43 %** de la varianza del salario en el conjunto de validación.
+""")
+
+code(r"""
+MODELOS_DIR = DATA_PROC / "modelos"
+MODELOS_DIR.mkdir(parents=True, exist_ok=True)
+
+mejor_lr_nombre = res_lr["RMSE"].idxmin()
+mejor_lr_cfg = [c for c in CONFIGS_LR if c[0] == mejor_lr_nombre][0]
+print(f"Configuración elegida (menor RMSE de validación): {mejor_lr_nombre} "
+      f"(regParam={mejor_lr_cfg[1]}, elasticNetParam={mejor_lr_cfg[2]})")
+
+# Entrenamiento final: se reajustan TODOS los componentes con 2025 completo (T1–T4)
+pipe_lr_final = pipeline_lr(mejor_lr_cfg[1], mejor_lr_cfg[2]).fit(df25)
+pipe_lr_final.write().overwrite().save(str(MODELOS_DIR / "regresion_lineal"))
+
+media_full = df25.agg(F.mean("salario_mensual")).first()[0]
+print(f"Media de referencia (2025 completo): Q{media_full:,.2f}")
+print("Modelo de regresión lineal final guardado en", MODELOS_DIR / "regresion_lineal")
+""")
+
+md("**Coeficientes del modelo final** (efecto sobre el salario respecto al intercepto, en quetzales; predictores numéricos ya en su escala original porque `standardization` solo afecta la optimización):")
+
+code(r"""
+def nombres_de_vector(pipeline_ajustado, df_base):
+    meta = pipeline_ajustado.transform(df_base.limit(1)).schema["features"].metadata["ml_attr"]["attrs"]
+    nombres = [None] * sum(len(v) for v in meta.values())
+    for grupo in meta.values():
+        for a in grupo:
+            nombres[a["idx"]] = a["name"]
+    return nombres
+
+
+lr_model_final = pipe_lr_final.stages[-1]
+nombres_lr = nombres_de_vector(pipe_lr_final, df25)
+coef_lr = (pd.DataFrame({"variable": nombres_lr, "coeficiente": lr_model_final.coefficients.toArray()})
+           .sort_values("coeficiente", key=np.abs, ascending=False))
+print(f"Intercepto: Q{lr_model_final.intercept:,.2f}")
+coef_lr.head(12).set_index("variable")
+""")
+
+# ---------------------------------------------------------------------------
+md(r"""
+---
+# 6. Pipeline de Random Forest
+
+### 6.1 Construcción del pipeline
+
+Se reutilizan los mismos pasos (a) y (b) de indexación y codificación *one‑hot* de las variables categóricas, y (c) el mismo `VectorAssembler`. `RandomForestRegressor` no requiere estandarizar los predictores porque cada árbol decide umbrales sobre cada variable de forma independiente; la escala de una variable no afecta en qué valor se corta.
+""")
+
+code(r"""
+def pipeline_rf(numTrees, maxDepth):
+    idx = StringIndexer(inputCols=CAT_COLS, outputCols=[f"{c}_idx" for c in CAT_COLS], handleInvalid="keep")
+    ohe = OneHotEncoder(inputCols=[f"{c}_idx" for c in CAT_COLS], outputCols=[f"{c}_ohe" for c in CAT_COLS])
+    ensamblador = VectorAssembler(inputCols=NUM_COLS + [f"{c}_ohe" for c in CAT_COLS], outputCol="features")
+    rf = RandomForestRegressor(featuresCol="features", labelCol="salario_mensual", predictionCol="salario_predicho",
+                                numTrees=numTrees, maxDepth=maxDepth, seed=SEED)
+    return Pipeline(stages=[idx, ohe, ensamblador, rf])
+
+
+# Configuraciones probadas (numTrees, maxDepth), semilla fija:
+CONFIGS_RF = [
+    ("rf_pequeno", 40, 5),
+    ("rf_medio", 80, 8),
+    ("rf_grande", 120, 10),
+]
+
+resultados_rf, modelos_rf = [], {}
+for nombre, numTrees, maxDepth in CONFIGS_RF:
+    modelo = pipeline_rf(numTrees, maxDepth).fit(train_sup)
+    pred_valid = modelo.transform(valid_sup)
+    r = evaluar(pred_valid, nombre)
+    r["numTrees"], r["maxDepth"] = numTrees, maxDepth
+    resultados_rf.append(r)
+    modelos_rf[nombre] = modelo
+
+res_rf = pd.DataFrame(resultados_rf).set_index("config")
+res_rf
+""")
+
+code(r"""
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+todas = pd.concat([res_lr[["RMSE", "R2"]], res_rf[["RMSE", "R2"]]])
+colores = ["#4C72B0"] * len(res_lr) + ["#DD8452"] * len(res_rf)
+axes[0].bar(todas.index, todas["RMSE"], color=colores)
+axes[0].axhline(res_base_valid["RMSE"], color="crimson", ls="--", label="Referencia")
+axes[0].set_title("RMSE de validación — regresión lineal (azul) vs Random Forest (naranja)"); axes[0].legend()
+axes[1].bar(todas.index, todas["R2"], color=colores)
+axes[1].set_title("R² de validación")
+for ax in axes:
+    ax.tick_params(axis="x", rotation=30)
+    plt.setp(ax.get_xticklabels(), ha="right")
+axes[0].yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+**Selección de configuración.** El desempeño mejora de forma consistente con más árboles y mayor profundidad: `rf_pequeno` (40 árboles, profundidad 5) obtiene RMSE Q2,161.02; `rf_medio` (80, 8) baja a Q2,033.37; `rf_grande` (120, 10) logra el **menor RMSE de validación (Q1,983.88**, MAE Q1,075.20, R² 0.53) y es la configuración elegida. La mejora entre configuraciones es decreciente (de pequeño a medio el RMSE baja 5.9 %; de medio a grande, 2.4 %), señal de que profundidades mayores aportarían cada vez menos y aumentarían el riesgo de sobreajuste, por lo que no se probaron árboles más profundos.
+
+**Random Forest frente a la regresión lineal (validación).** Con la misma partición, Random Forest **supera a la regresión lineal en las tres métricas**: RMSE Q1,983.88 frente a Q2,186.42 (**‑9.3 %**), MAE Q1,075.20 frente a Q1,210.14 (**‑11.1 %**) y R² 0.53 frente a 0.43. La ventaja es coherente con la naturaleza de los datos: la regresión lineal fuerza que cada categoría (por ejemplo, cada nivel educativo) sume un efecto **constante** al salario, mientras que Random Forest puede aprender **interacciones y umbrales** (p. ej., que la combinación de educación superior *y* categoría de gobierno se asocie a salarios mucho mayores que la suma de sus efectos por separado, o que el efecto de las horas trabajadas cambie según la categoría ocupacional) sin que el equipo tenga que especificarlas a mano.
+""")
+
+code(r"""
+mejor_rf_nombre = res_rf["RMSE"].idxmin()
+mejor_rf_cfg = [c for c in CONFIGS_RF if c[0] == mejor_rf_nombre][0]
+print(f"Configuración elegida (menor RMSE de validación): {mejor_rf_nombre} "
+      f"(numTrees={mejor_rf_cfg[1]}, maxDepth={mejor_rf_cfg[2]})")
+
+pipe_rf_final = pipeline_rf(mejor_rf_cfg[1], mejor_rf_cfg[2]).fit(df25)
+pipe_rf_final.write().overwrite().save(str(MODELOS_DIR / "random_forest"))
+print("Modelo de Random Forest final guardado en", MODELOS_DIR / "random_forest")
+""")
+
+md("### 6.2 Importancia de variables (modelo final)")
+
+code(r"""
+pred_ejemplo = pipe_rf_final.transform(df25.limit(1))
+meta_attrs = pred_ejemplo.schema["features"].metadata["ml_attr"]["attrs"]
+nombres_features = [None] * sum(len(v) for v in meta_attrs.values())
+for grupo in meta_attrs.values():
+    for a in grupo:
+        nombres_features[a["idx"]] = a["name"]
+
+rf_model_final = pipe_rf_final.stages[-1]
+importancias = (pd.DataFrame({"variable": nombres_features, "importancia": rf_model_final.featureImportances.toArray()})
+                 .sort_values("importancia", ascending=False).head(12))
+
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.barh(importancias["variable"][::-1], importancias["importancia"][::-1], color="#DD8452")
+ax.set_title("Importancia de variables — Random Forest final (12 principales)")
+ax.set_xlabel("Importancia (Gini)")
+plt.tight_layout(); plt.show()
+importancias.set_index("variable")
+""")
+
+md(r"""
+**Interpretación.** Las variables con mayor importancia son las categorías de **educación alta** (Maestría 0.19, Superior 0.15) y de **categoría ocupacional** (empleado de gobierno 0.10, jornalero 0.08, empresa privada 0.07), seguidas de las tres numéricas (horas semanales 0.09, edad 0.09, antigüedad 0.07); el dominio aporta poco (Urbano metropolitano 0.03 y menos). Coincide con los coeficientes de la regresión lineal (tabla anterior): Doctorado, Maestría y Superior son los efectos de mayor magnitud sobre el intercepto, y servicio doméstico el más negativo. Ambos modelos coinciden en que **la educación y la categoría ocupacional explican más que las variables numéricas**, en línea con lo observado en las secciones 2 y 3: la correlación de edad, antigüedad y horas con el salario es débil (r ≤ 0.18) y las diferencias grandes de salario aparecen entre grupos categóricos.
+""")
+
+# ---------------------------------------------------------------------------
+md(r"""
+---
+# 7. Entrenamiento final y evaluación en 2026
+
+Con la configuración ya seleccionada por algoritmo (sección 5 y 6) y **reentrenada con los cuatro trimestres de 2025** (`pipe_lr_final`, `pipe_rf_final`), se generan predicciones sobre el primer trimestre de 2026 (`df26`), preparado con exactamente las mismas reglas de la sección 1. Los dos modelos y el modelo de referencia se evalúan sobre **los mismos registros** de prueba.
+""")
+
+code(r"""
+pred_test_base = df26.withColumn("salario_predicho", F.lit(media_full))
+pred_test_lr = pipe_lr_final.transform(df26)
+pred_test_rf = pipe_rf_final.transform(df26)
+
+comparacion = pd.DataFrame([
+    evaluar(pred_test_base, "Referencia (media 2025)"),
+    evaluar(pred_test_lr, "Regresión lineal"),
+    evaluar(pred_test_rf, "Random Forest"),
+]).set_index("config")
+comparacion.insert(0, "n_prueba", df26.count())
+comparacion
+""")
+
+code(r"""
+comparacion_valid_test = pd.DataFrame({
+    "RMSE_validacion_2025T4": [res_base_valid["RMSE"], res_lr.loc[mejor_lr_nombre, "RMSE"], res_rf.loc[mejor_rf_nombre, "RMSE"]],
+    "RMSE_prueba_2026T1": comparacion["RMSE"].values,
+    "R2_validacion_2025T4": [res_base_valid["R2"], res_lr.loc[mejor_lr_nombre, "R2"], res_rf.loc[mejor_rf_nombre, "R2"]],
+    "R2_prueba_2026T1": comparacion["R2"].values,
+}, index=["Referencia", "Regresión lineal", "Random Forest"])
+comparacion_valid_test
+""")
+
+md(r"""
+**Interpretación.** En la prueba de 2026T1 (13,258 registros, no usados en ninguna etapa anterior):
+
+- El **modelo de referencia** vuelve a tener R² prácticamente nulo (‑0.003): confirma que predecir la media no captura ninguna variación del salario, ni siquiera de un trimestre a otro.
+- La **regresión lineal** obtiene RMSE Q2,163.75, MAE Q1,240.71 y R² 0.43 (redujo el RMSE de la referencia en 24.6 %).
+- **Random Forest** vuelve a ser el mejor modelo: RMSE Q1,957.90, MAE Q1,101.25 y **R² 0.53** (redujo el RMSE de la referencia en 31.8 % y el de la regresión lineal en 9.5 %).
+- Ambos modelos generalizan bien: sus métricas en 2026T1 son muy cercanas a las de validación (2025T4) — de hecho, el RMSE de los dos es **ligeramente menor** en 2026T1 que en validación (regresión lineal: Q2,186.42 → Q2,163.75; Random Forest: Q1,983.88 → Q1,957.90). No hay señal de sobreajuste al conjunto de desarrollo; la relación entre los seis predictores y el salario parece estable entre 2025 y el primer trimestre de 2026.
+- **Random Forest obtiene mejores resultados que la regresión lineal en los tres conjuntos** (entrenamiento/validación y prueba), de forma consistente y con un margen similar (8–10 % de RMSE). La diferencia se explica, como en la sección 6.2, por su capacidad de capturar interacciones y umbrales entre educación, categoría ocupacional y las variables numéricas que un modelo lineal aditivo no puede representar sin que se construyan esas interacciones a mano.
+""")
+
+# ---------------------------------------------------------------------------
+md(r"""
+---
+# 8. Visualización y análisis de errores
+
+Se define el residuo como `residuo = salario_mensual − salario_predicho`: un **residuo positivo indica subestimación** (el modelo predijo menos de lo real) y uno **negativo, sobreestimación**. Los gráficos de dispersión usan la **misma muestra** de hasta 5,000 registros de 2026T1 para los dos modelos, de modo que sean directamente comparables; las tablas por grupo se calculan sobre **todos** los registros de prueba (13,258).
+""")
+
+code(r"""
+comp_test = (
+    pred_test_lr.select(*CLAVE, "salario_mensual", "nivel_educativo", "dominio",
+                         F.col("salario_predicho").alias("pred_lr"))
+    .join(pred_test_rf.select(*CLAVE, F.col("salario_predicho").alias("pred_rf")), CLAVE)
+    .withColumn("residuo_lr", F.col("salario_mensual") - F.col("pred_lr"))
+    .withColumn("residuo_rf", F.col("salario_mensual") - F.col("pred_rf"))
+).cache()
+
+N_MUESTRA_ERROR = 5_000
+n_test = comp_test.count()
+muestra_pred = (comp_test.sample(fraction=min(1.0, N_MUESTRA_ERROR / n_test), seed=SEED)
+                 .limit(N_MUESTRA_ERROR).toPandas())
+print(f"Muestra para gráficos de error: {len(muestra_pred):,} de {n_test:,} registros de 2026T1")
+""")
+
+code(r"""
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+lims = (0, max(muestra_pred["salario_mensual"].max(), muestra_pred["pred_lr"].max(), muestra_pred["pred_rf"].max()) * 1.05)
+for ax, col, titulo in [(axes[0], "pred_lr", "Regresión lineal"), (axes[1], "pred_rf", "Random Forest")]:
+    ax.scatter(muestra_pred[col], muestra_pred["salario_mensual"], s=8, alpha=0.25, color="#4C72B0")
+    ax.plot(lims, lims, color="crimson", ls="--", label="y = x (predicción perfecta)")
+    ax.set_xlim(lims); ax.set_ylim(lims)
+    ax.set_xlabel("Salario predicho (Q)"); ax.set_ylabel("Salario real (Q)")
+    ax.set_title(f"Real vs. predicho — {titulo} (2026T1, muestra)")
+    ax.legend()
+    ax.xaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+    ax.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+plt.tight_layout(); plt.show()
+""")
+
+code(r"""
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+for ax, pred_col, res_col, titulo in [(axes[0], "pred_lr", "residuo_lr", "Regresión lineal"),
+                                       (axes[1], "pred_rf", "residuo_rf", "Random Forest")]:
+    ax.scatter(muestra_pred[pred_col], muestra_pred[res_col], s=8, alpha=0.25, color="#55A868")
+    ax.axhline(0, color="crimson", ls="--")
+    ax.set_xlabel("Salario predicho (Q)"); ax.set_ylabel("Residuo = real − predicho (Q)")
+    ax.set_title(f"Residuos vs. predicho — {titulo} (2026T1, muestra)")
+    ax.xaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+Ambos gráficos muestran el mismo patrón: por debajo de aproximadamente Q6,000 predichos los puntos se reparten alrededor de la línea *y = x* / la línea de cero, pero **por encima de ese valor casi todos los puntos quedan por arriba de la diagonal** (residuo positivo): el modelo predice salarios más bajos que los reales para los sueldos altos. El patrón es algo menos marcado en Random Forest, cuyos residuos están un poco menos dispersos.
+""")
+
+code(r"""
+def tabla_por_grupo(col):
+    filas = []
+    for nombre, res_col, pred_col in [("Regresión lineal", "residuo_lr", "pred_lr"), ("Random Forest", "residuo_rf", "pred_rf")]:
+        t = (comp_test.groupBy(col).agg(
+                F.count("*").alias("n"),
+                F.mean(F.abs(res_col)).alias("MAE"),
+                F.mean(res_col).alias("error_medio"))
+             .toPandas().assign(modelo=nombre))
+        filas.append(t)
+    return pd.concat(filas).pivot(index=col, columns="modelo", values=["n", "MAE", "error_medio"])
+
+
+print("--- Por nivel educativo ---")
+display(tabla_por_grupo("nivel_educativo").reindex([o for o in ORDEN_EDU if o != "DESCONOCIDO"]).dropna(how="all").round(1))
+print("--- Por dominio ---")
+display(tabla_por_grupo("dominio").round(1))
+""")
+
+md(r"""
+**Lectura de las tablas por grupo.** El **MAE crece con el nivel educativo** en los dos modelos: es menor en primaria/básico/preprimaria (Q640–Q900) y mucho mayor en superior, maestría y sobre todo doctorado (Q4,600–Q12,900, con solo 12 registros de prueba); el **error medio** (sesgo) también es positivo y creciente en ese tramo — superior se **subestima** de forma sistemática en ambos modelos (+Q271 en Random Forest, +Q296 en la lineal) y doctorado aún más (+Q5,771 y +Q6,063). Maestría, en cambio, muestra un sesgo **negativo** (sobreestimación leve, ‑Q225 y ‑Q132): es un grupo pequeño (183 registros) con salarios muy dispersos, no sistemáticamente subestimado. Por dominio, el MAE es mayor en **urbano metropolitano** (Q1,314–Q1,446) que en resto urbano y, sobre todo, rural nacional (Q774–Q914), reflejo de que el dominio con salarios más altos y dispersos es también el más difícil de predecir. Random Forest tiene **menor MAE que la regresión lineal en todos los grupos** (p. ej. superior: Q2,291 vs Q2,566; rural nacional: Q774 vs Q914), consistente con su mejor RMSE global, aunque no elimina el sesgo hacia arriba en los grupos de salario alto.
+""")
+
+code(r"""
+p90 = df26.agg(F.expr("percentile(salario_mensual, 0.9)")).first()[0]
+alto = comp_test.filter(F.col("salario_mensual") >= p90)
+bajo = comp_test.filter(F.col("salario_mensual") < p90)
+n_alto, n_bajo = alto.count(), bajo.count()
+
+filas_pct = []
+for nombre, res_col in [("Regresión lineal", "residuo_lr"), ("Random Forest", "residuo_rf")]:
+    filas_pct.append({
+        "modelo": nombre,
+        "error_medio_top10pct (>= P90)": alto.agg(F.mean(res_col)).first()[0],
+        "error_medio_resto90pct (< P90)": bajo.agg(F.mean(res_col)).first()[0],
+    })
+print(f"P90 del salario en 2026T1: Q{p90:,.0f} | top 10%: {n_alto:,} registros | resto: {n_bajo:,} registros")
+pd.DataFrame(filas_pct).set_index("modelo").round(1)
+""")
+
+md(r"""
+### Discusión final
+
+**¿Hay tendencia a subestimar o sobreestimar según el nivel del salario?** Sí, y es sistemática: para el **10 % de salarios más altos** (≥ Q6,000, 1,542 registros de 2026T1) el error medio es **+Q3,192 en la regresión lineal y +Q2,843 en Random Forest**: ambos modelos **subestiman fuertemente** los salarios altos. Para el **90 % restante** (11,716 registros) el error medio es pequeño y **negativo** (‑Q284 en la lineal, ‑Q253 en Random Forest): una **ligera sobreestimación** de los salarios típicos. Es el patrón esperable dado lo visto en la sección 2: el salario tiene una asimetría muy fuerte a la derecha (coeficiente 6.0, máximo 33 veces la mediana) y los modelos, entrenados para minimizar el error promedio, aprenden a acertar bien en la mayoría de los casos (salarios entre Q1,800 y Q4,000) a costa de no alcanzar los valores extremos de la cola. Random Forest atenúa el sesgo en la cola alta (‑10.9 % frente a la lineal) porque puede aislar combinaciones de educación y categoría asociadas a sueldos altos en hojas específicas del árbol, pero no lo elimina: con solo seis predictores observados no hay información suficiente para distinguir, dentro de "educación superior y empleado de gobierno", a la persona que gana Q6,000 de la que gana Q20,000.
+
+**Síntesis de todo el laboratorio.** El análisis exploratorio (secciones 1–4) ya anticipaba estos resultados: el salario es la variable con mayor dispersión y asimetría de la base; su correlación lineal con edad, antigüedad y horas es débil (r ≤ 0.18); y las diferencias grandes aparecen entre grupos (hasta 5× entre categorías ocupacionales y 8× entre niveles educativos). La segmentación por KMeans confirmó que edad, antigüedad y horas definen perfiles de vida laboral pero **no** separan bien el salario (la mediana es casi la misma en tres de los cuatro clusters). Los modelos supervisados de las secciones 5–7 confirman esa misma historia desde la predicción: con R² entre 0.43 y 0.53, **la mayor parte de la variación del salario no la explican estas seis variables**, y la fracción que sí explican proviene sobre todo de la **educación y la categoría ocupacional**, no de la edad, la antigüedad o las horas trabajadas. Random Forest es consistentemente el mejor de los dos algoritmos (mejor RMSE, MAE y R² en validación y en la prueba de 2026), porque modela interacciones y umbrales entre esas variables categóricas y numéricas sin necesidad de especificarlos, aunque comparte con la regresión lineal la misma limitación de fondo: ambos subestiman de forma importante a los salarios más altos. Estas conclusiones describen a los **asalariados de 15 años o más con salario positivo registrado en la ENEIC de 2025–2026**, sin ponderar por `FACTOR`; no son estimaciones oficiales de la población guatemalteca ni deben leerse como una recomendación normativa sobre cuánto debería ganar una persona.
 """)
 
 # ---------------------------------------------------------------------------
